@@ -23,7 +23,7 @@ namespace OpenTkControl
     /// <summary>
     /// Interaction logic for OpenTkControlBase.xaml. OpenTkControlBase is a base class for OpenTK WPF controls
     /// </summary>
-    public abstract partial class OpenTkControlBase
+    public abstract partial class OpenTkControlBase : INotifyPropertyChanged
     {
         /// <summary>
         /// Initialize the OpenTk Toolkit
@@ -167,6 +167,7 @@ namespace OpenTkControl
         /// Called whenever an exception occurs during initialization, rendering or deinitialization
         /// </summary>
         public event EventHandler<UnhandledExceptionEventArgs> ExceptionOccurred;
+        public event PropertyChangedEventHandler PropertyChanged;
 
         /// <summary>
         /// An OpenTK graphics context
@@ -254,6 +255,7 @@ namespace OpenTkControl
         #region WGL_NV_DX_introp extension need.
 
         private DeviceEx _wgl_device;
+        private Texture _wgl_dx_texture;
         private Surface _wgl_dx_shared_surface;
         private int _wgl_gl_shared_texture;
         private IntPtr _wgl_handled_shared_surface;
@@ -264,7 +266,17 @@ namespace OpenTkControl
 
         private D3DImage _wgl_image;
 
-        public bool IsUsingNVDXInterop { get; private set; } = false;
+        private bool _is_using_nv_dx_interop = false;
+
+        public bool IsUsingNVDXInterop
+        {
+            get { return _is_using_nv_dx_interop; }
+            set
+            {
+                _is_using_nv_dx_interop = value;
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsUsingNVDXInterop)));
+            }
+        }
 
         public bool PerferPerfomance
         {
@@ -443,8 +455,8 @@ namespace OpenTkControl
             {
                 _wgl_d3d = new Direct3DEx();
 
-                int w = (int)this.ActualWidth;
-                int h = (int)this.ActualHeight;
+                int w = (int)ActualWidth;
+                int h = (int)ActualHeight;
 
                 var present_params = new PresentParameters()
                 {
@@ -618,10 +630,13 @@ namespace OpenTkControl
 
                         RunOnUiThread(() =>
                         {
-                            _wgl_image.Lock();
-                            _wgl_image.SetBackBuffer(D3DResourceType.IDirect3DSurface9, _wgl_dx_shared_surface.NativePointer);
-                            _wgl_image.AddDirtyRect(new Int32Rect(0, 0, _bitmapWidth, _bitmapHeight));
-                            _wgl_image.Unlock();
+                            if (_wgl_image.IsFrontBufferAvailable)
+                            {
+                                _wgl_image.Lock();
+                                _wgl_image.SetBackBuffer(D3DResourceType.IDirect3DSurface9, _wgl_dx_shared_surface.NativePointer);
+                                _wgl_image.AddDirtyRect(new Int32Rect(0, 0, _bitmapWidth, _bitmapHeight));
+                                _wgl_image.Unlock();
+                            }
                         }).Wait();
                     }
                 }
@@ -807,6 +822,12 @@ namespace OpenTkControl
         {
             CleanNVDXIntropResource();
 
+            /*
+             Normally Nvidia graphics card support CreateRenderTarget() but Intel can't do it. the later will get InvaildOperation error at glFramebufferTexture2D().
+             
+             */
+
+            /*// Maybe not work in Intel :b
             _wgl_dx_shared_surface = Surface.CreateRenderTarget(
             _wgl_device,
             width,
@@ -815,12 +836,24 @@ namespace OpenTkControl
             MultisampleType.None,
             0,
             false);
+            */
+
+            var share_handler=IntPtr.Zero;
+            _wgl_dx_texture = new Texture(_wgl_device, width, height, 0, Usage.RenderTarget, Format.A8R8G8B8, Pool.Default,ref share_handler);
+            _wgl_dx_shared_surface = _wgl_dx_texture.GetSurfaceLevel(0);
+            
+            //_wgl_dx_shared_surface = Surface.CreateOffscreenPlain(_wgl_device, width, height, Format.A8R8G8B8, Pool.Default);
 
             _wgl_gl_shared_texture = GL.GenTexture();
 
+            if (!WGL_NV_DX_interop.DXSetResourceShareHandleNV(_wgl_dx_texture.NativePointer, share_handler))
+            {
+                throw new Exception("ResizeNVDXIntropResource(): DXSetResourceShareHandleNV() fail");
+            }
+
             _wgl_handled_shared_surface = WGL_NV_DX_interop.DXRegisterObjectNV(
             _wgl_device_handler,
-            _wgl_dx_shared_surface.NativePointer,
+            _wgl_dx_texture.NativePointer,
             (uint)_wgl_gl_shared_texture,
             (uint)TextureTarget.Texture2D,
             WGL_NV_DX_interop.Access.WGL_ACCESS_READ_WRITE_NV);
@@ -876,6 +909,13 @@ namespace OpenTkControl
 
         private void CleanNVDXIntropResource()
         {
+            if (_wgl_dx_texture!=null)
+            {
+                _wgl_dx_texture.Dispose();
+                _wgl_dx_shared_surface = null;
+                _wgl_dx_texture = null;
+            }
+
             if (_wgl_dx_shared_surface!=null)
             {
                 WGL_NV_DX_interop.DXUnregisterObjectNV(_wgl_device_handler, _wgl_handled_shared_surface);
