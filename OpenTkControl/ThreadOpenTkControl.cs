@@ -48,6 +48,11 @@ namespace OpenTkControl
             return Dispatcher.InvokeAsync(action).Task;
         }
 
+        public override Task<T> RunOnUiThread<T>(Func<T> action)
+        {
+            return Dispatcher.InvokeAsync(action).Task;
+        }
+
         protected override void OnLoaded(object sender, RoutedEventArgs args)
         {
             base.OnLoaded(sender, args);

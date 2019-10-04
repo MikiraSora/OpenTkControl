@@ -27,6 +27,12 @@ namespace OpenTkControl
             return null;
         }
 
+        public override Task<T> RunOnUiThread<T>(Func<T> action)
+        {
+            var result = action();
+            return Task.FromResult(result);
+        }
+
         protected override void OnLoaded(object sender, RoutedEventArgs args)
         {
             base.OnLoaded(sender, args);

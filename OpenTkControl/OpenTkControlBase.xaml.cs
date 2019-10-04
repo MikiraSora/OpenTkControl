@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,6 +14,8 @@ using OpenTK;
 using OpenTK.Graphics;
 using OpenTK.Graphics.OpenGL;
 using OpenTK.Platform;
+using OpenTkControl.Extension;
+using SharpDX.Direct3D9;
 using PixelFormat = OpenTK.Graphics.OpenGL.PixelFormat;
 
 namespace OpenTkControl
@@ -221,6 +224,7 @@ namespace OpenTkControl
         /// Set whenever a repaint is requested
         /// </summary>
         protected readonly ManualResetEvent ManualRepaintEvent = new ManualResetEvent(false);
+        private readonly Timer render_counter_timer;
 
         /// <summary>
         /// The last time a frame was rendered
@@ -246,6 +250,34 @@ namespace OpenTkControl
         /// True if OnLoaded has already been called
         /// </summary>
         private bool _alreadyLoaded;
+
+        #region WGL_NV_DX_introp extension need.
+
+        private DeviceEx _wgl_device;
+        private Surface _wgl_dx_shared_surface;
+        private int _wgl_gl_shared_texture;
+        private IntPtr _wgl_handled_shared_surface;
+        private IntPtr[] _wgl_block_surfaces;
+        private int _wgl_fbo;
+        private IntPtr _wgl_device_handler;
+        private Direct3DEx _wgl_d3d;
+
+        private D3DImage _wgl_image;
+
+        public bool IsUsingNVDXInterop { get; private set; } = false;
+
+        public bool PerferPerfomance
+        {
+            get { return (bool)GetValue(PerferPerfomanceProperty); }
+            set { SetValue(PerferPerfomanceProperty, value); }
+        }
+
+        public static readonly DependencyProperty PerferPerfomanceProperty =
+            DependencyProperty.Register("PerferPerfomance", typeof(bool), typeof(OpenTkControlBase), new PropertyMetadata(true));
+
+        public int NVDXInteropFramebuffer => IsUsingNVDXInterop ? _wgl_fbo : throw new Exception("NVDXInteropFramebuffer is available when control is using NVDXInterop");
+
+        #endregion
 
         /// <summary>
         /// Creates the <see cref="OpenTkControlBase"/>/>
@@ -333,6 +365,7 @@ namespace OpenTkControl
         /// <param name="action">The action to run</param>
         /// <returns>a Task that will complete when the action finishes running or null if already complete</returns>
         public abstract Task RunOnUiThread(Action action);
+        public abstract Task<T> RunOnUiThread<T>(Func<T> action);
 
         /// <summary>
         /// Called when this control is loaded
@@ -394,10 +427,59 @@ namespace OpenTkControl
                 _newContext = true;
                 _context.LoadAll();
                 _context.MakeCurrent(_windowInfo);
+
+                if (RunOnUiThread(()=>PerferPerfomance).Result)
+                    IsUsingNVDXInterop = TryInitNVDXIntrop();
             }
             catch (Exception e)
             {
                 ExceptionOccurred?.Invoke(this, new UnhandledExceptionEventArgs(e, false));
+            }
+        }
+
+        private bool TryInitNVDXIntrop()
+        {
+            try
+            {
+                _wgl_d3d = new Direct3DEx();
+
+                int w = (int)this.ActualWidth;
+                int h = (int)this.ActualHeight;
+
+                var present_params = new PresentParameters()
+                {
+                    Windowed = true,
+                    SwapEffect = SwapEffect.Discard,
+                    DeviceWindowHandle = _windowInfo.Handle,
+                    PresentationInterval = PresentInterval.Default
+                };
+
+                _wgl_device = new DeviceEx(
+                _wgl_d3d,
+                0,
+                DeviceType.Hardware,
+                IntPtr.Zero,
+                CreateFlags.HardwareVertexProcessing | CreateFlags.Multithreaded | CreateFlags.FpuPreserve,
+                present_params);
+
+                if (!OpenGLExtensionLoader.LoadWGLExtension<WGL_NV_DX_interop>())
+                    return false;
+
+                _wgl_device_handler = WGL_NV_DX_interop.DXOpenDeviceNV(_wgl_device.NativePointer);
+
+                //update control
+                RunOnUiThread(() =>
+                {
+                    _wgl_image = new D3DImage(96, 96);
+                    Image.Source = _wgl_image;
+                });
+
+                return true;
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"call TryInitNVDXIntrop() failed : {e.Message}");
+                return false;
             }
         }
 
@@ -423,7 +505,7 @@ namespace OpenTkControl
                 ExceptionOccurred?.Invoke(this, new UnhandledExceptionEventArgs(e, false));
             }
         }
-        
+
         /// <summary>
         /// Handles generating screenshots and updating the display image
         /// </summary>
@@ -437,7 +519,6 @@ namespace OpenTkControl
 
                 if ((_continuous && !IsVisible) || width == 0 || height == 0)
                     return TimeSpan.FromMilliseconds(20);
-
 
                 if (_continuous && _frameRateLimit > 0 && _frameRateLimit < 1000)
                 {
@@ -456,21 +537,6 @@ namespace OpenTkControl
                 if (!ReferenceEquals(GraphicsContext.CurrentContext, _context))
                     _context.MakeCurrent(_windowInfo);
 
-                bool resized = false;
-                Task resizeBitmapTask = null;
-                //Need Abs(...) > 1 to handle an edge case where the resizing the bitmap causes the height to increase in an infinite loop
-                if (_bitmap == null || Math.Abs(_bitmapWidth - width) > 1 || Math.Abs(_bitmapHeight - height) > 1)
-                {
-                    resized = true;
-                    _bitmapWidth = width;
-                    _bitmapHeight = height;
-                    resizeBitmapTask = RunOnUiThread(() =>
-                    {
-                        _bitmap = new WriteableBitmap(width, height, 96, 96, PixelFormats.Pbgra32, null);
-                        _backBuffer = _bitmap.BackBuffer;
-                    });
-                }
-
                 if (currentBufferWidth != _bitmapWidth || currentBufferHeight != _bitmapHeight)
                 {
                     CreateOpenGlBuffers(_bitmapWidth, _bitmapHeight);
@@ -486,7 +552,43 @@ namespace OpenTkControl
                     repaintRequests.Add(tcs);
                 }
 
-                GlRenderEventArgs args = new GlRenderEventArgs(_bitmapWidth, _bitmapHeight, resized, false, CheckNewContext());
+                bool resized = false;
+                Task resizeBitmapTask = null;
+
+                //Need Abs(...) > 1 to handle an edge case where the resizing the bitmap causes the height to increase in an infinite loop
+                if (_bitmap == null || Math.Abs(_bitmapWidth - width) > 1 || Math.Abs(_bitmapHeight - height) > 1)
+                {
+                    resized = true;
+                    _bitmapWidth = width;
+                    _bitmapHeight = height;
+
+                    if (IsUsingNVDXInterop)
+                        ResizeNVDXIntropResource(width, height);
+
+                    resizeBitmapTask = RunOnUiThread(() =>
+                    {
+                        Console.WriteLine($"new WriteableBitmap() {width},{height}");
+                        var source = PresentationSource.FromVisual(this);
+                        var dpiX = 96.0 * source.CompositionTarget.TransformToDevice.M11;
+                        var dpiY = 96.0 * source.CompositionTarget.TransformToDevice.M22;
+                        _bitmap = new WriteableBitmap(width, height, dpiX, dpiY, PixelFormats.Pbgra32, null);
+                        _backBuffer = _bitmap.BackBuffer;
+                    });
+                }
+
+
+                var args = new GlRenderEventArgs(_bitmapWidth, _bitmapHeight, resized, false, CheckNewContext());
+
+                if (IsUsingNVDXInterop)
+                {
+                    if (_check_ready())
+                    {
+                        //begin draw
+                        WGL_NV_DX_interop.DXLockObjectsNV(_wgl_device_handler, 1, _wgl_block_surfaces);
+                        GL.BindFramebuffer(FramebufferTarget.Framebuffer, _wgl_fbo);
+                    }
+                }
+
                 try
                 {
                     OnGlRender(args);
@@ -507,27 +609,46 @@ namespace OpenTkControl
                 if (dirtyArea.Width <= 0 || dirtyArea.Height <= 0)
                     return TimeSpan.Zero;
 
-                try
+                if (IsUsingNVDXInterop)
                 {
-                    resizeBitmapTask?.Wait();
+                    //end draw
+                    if (_check_ready())
+                    {
+                        WGL_NV_DX_interop.DXUnlockObjectsNV(_wgl_device_handler, 1, _wgl_block_surfaces);
+
+                        RunOnUiThread(() =>
+                        {
+                            _wgl_image.Lock();
+                            _wgl_image.SetBackBuffer(D3DResourceType.IDirect3DSurface9, _wgl_dx_shared_surface.NativePointer);
+                            _wgl_image.AddDirtyRect(new Int32Rect(0, 0, _bitmapWidth, _bitmapHeight));
+                            _wgl_image.Unlock();
+                        }).Wait();
+                    }
+                }
+                else
+                {
                     try
                     {
-                        _previousUpdateImageTask?.Wait();
+                        resizeBitmapTask?.Wait();
+                        try
+                        {
+                            _previousUpdateImageTask?.Wait();
+                        }
+                        finally
+                        {
+                            _previousUpdateImageTask = null;
+                        }
                     }
-                    finally
+                    catch (TaskCanceledException)
                     {
-                        _previousUpdateImageTask = null;
+                        return TimeSpan.Zero;
                     }
-                }
-                catch (TaskCanceledException)
-                {
-                    return TimeSpan.Zero;
-                }
 
-                if(_backBuffer != IntPtr.Zero)
-                    GL.ReadPixels(0, 0, _bitmapWidth, _bitmapHeight, PixelFormat.Bgra, PixelType.UnsignedByte, _backBuffer);
+                    if (_backBuffer != IntPtr.Zero)
+                        GL.ReadPixels(0, 0, _bitmapWidth, _bitmapHeight, PixelFormat.Bgra, PixelType.UnsignedByte, _backBuffer);
 
-                _previousUpdateImageTask = RunOnUiThread(() => UpdateImage(dirtyArea));
+                    _previousUpdateImageTask = RunOnUiThread(() => UpdateImage(dirtyArea));
+                }
             }
             catch (Exception e)
             {
@@ -535,6 +656,11 @@ namespace OpenTkControl
             }
 
             return TimeSpan.Zero;
+
+            bool _check_ready()
+            {
+                return _wgl_block_surfaces != null;
+            }
         }
 
         /// <summary>
@@ -677,6 +803,101 @@ namespace OpenTkControl
             }
         }
 
+        private void ResizeNVDXIntropResource(int width, int height)
+        {
+            CleanNVDXIntropResource();
+
+            _wgl_dx_shared_surface = Surface.CreateRenderTarget(
+            _wgl_device,
+            width,
+            height,
+            Format.A8R8G8B8,
+            MultisampleType.None,
+            0,
+            false);
+
+            _wgl_gl_shared_texture = GL.GenTexture();
+
+            _wgl_handled_shared_surface = WGL_NV_DX_interop.DXRegisterObjectNV(
+            _wgl_device_handler,
+            _wgl_dx_shared_surface.NativePointer,
+            (uint)_wgl_gl_shared_texture,
+            (uint)TextureTarget.Texture2D,
+            WGL_NV_DX_interop.Access.WGL_ACCESS_READ_WRITE_NV);
+
+            _wgl_block_surfaces = new[] { _wgl_handled_shared_surface };
+
+            _wgl_fbo = GL.GenFramebuffer();
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, _wgl_fbo);
+            {
+                GL.FramebufferTexture2D(
+                FramebufferTarget.Framebuffer,
+                FramebufferAttachment.ColorAttachment0,
+                TextureTarget.Texture2D,
+                (uint)_wgl_gl_shared_texture,
+                0);
+
+                var status = GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer);
+                if (status != FramebufferErrorCode.FramebufferComplete && status != FramebufferErrorCode.FramebufferUnsupported)
+                {
+                    //clean error ,maybe FramebufferTexture2D() get InvaildOperation.
+                    GL.GetError();
+
+                    IsUsingNVDXInterop = false;
+                    CleanNVDXIntropResource();
+                    CleanNVDXIntropDeviceResource();
+
+                    throw new Exception($"In ResizeNVDXIntropResource(),CheckFramebufferStatus() get {status} status. Now is use default implement which using WritableBitmap&glReadPixels().");
+                }
+            }
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        }
+
+        private void CleanNVDXIntropDeviceResource()
+        {
+            if (_wgl_device_handler!=null)
+            {
+                WGL_NV_DX_interop.DXCloseDeviceNV(_wgl_device_handler);
+                _wgl_device_handler = IntPtr.Zero;
+            }
+
+            if (_wgl_device != null)
+            {
+                _wgl_device.Dispose();
+                _wgl_device = null;
+            }
+
+            if (_wgl_d3d!=null)
+            {
+                _wgl_d3d.Dispose();
+                _wgl_d3d = null;
+            }
+        }
+
+        private void CleanNVDXIntropResource()
+        {
+            if (_wgl_dx_shared_surface!=null)
+            {
+                WGL_NV_DX_interop.DXUnregisterObjectNV(_wgl_device_handler, _wgl_handled_shared_surface);
+
+                _wgl_dx_shared_surface.Dispose();
+                _wgl_dx_shared_surface = null;
+                _wgl_block_surfaces = null;
+            }
+
+            if (_wgl_fbo!=0)
+            {
+                GL.DeleteFramebuffer(_wgl_fbo);
+                _wgl_fbo = 0;
+            }
+
+            if (_wgl_gl_shared_texture != 0)
+            {
+                GL.DeleteTexture(_wgl_gl_shared_texture);
+                _wgl_gl_shared_texture = 0;
+            }
+        }
+
         /// <summary>
         /// Releases all of the OpenGL buffers currently in use
         /// </summary>
@@ -706,7 +927,11 @@ namespace OpenTkControl
         private void OnGlRender(GlRenderEventArgs args)
         {
             GlRender?.Invoke(this, args);
+            CheckGLError();
+        }
 
+        private void CheckGLError()
+        {
             ErrorCode error = GL.GetError();
             if (error != ErrorCode.NoError)
                 throw new GraphicsException(error.ToString());
