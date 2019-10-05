@@ -225,7 +225,6 @@ namespace OpenTkControl
         /// Set whenever a repaint is requested
         /// </summary>
         protected readonly ManualResetEvent ManualRepaintEvent = new ManualResetEvent(false);
-        private readonly Timer render_counter_timer;
 
         /// <summary>
         /// The last time a frame was rendered
@@ -252,7 +251,7 @@ namespace OpenTkControl
         /// </summary>
         private bool _alreadyLoaded;
 
-        #region WGL_NV_DX_introp extension need.
+        #region WGL_NV_DX_introp extension need. Almost fields are not public for users.
 
         private DeviceEx _wgl_device;
         private Texture _wgl_dx_texture;
@@ -263,21 +262,25 @@ namespace OpenTkControl
         private int _wgl_fbo;
         private IntPtr _wgl_device_handler;
         private Direct3DEx _wgl_d3d;
-
         private D3DImage _wgl_image;
+        private bool _wgl_is_using_nv_dx_interop = false;
 
-        private bool _is_using_nv_dx_interop = false;
-
+        /// <summary>
+        /// Indicates whether the control is using OpenGL extension named WGL_NV_DX_interop.
+        /// </summary>
         public bool IsUsingNVDXInterop
         {
-            get { return _is_using_nv_dx_interop; }
+            get { return _wgl_is_using_nv_dx_interop; }
             set
             {
-                _is_using_nv_dx_interop = value;
+                _wgl_is_using_nv_dx_interop = value;
                 PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsUsingNVDXInterop)));
             }
         }
 
+        /// <summary>
+        /// Indicates whether the control should use a better rendering implementation(for example it will use a OpenGL extension named WGL_NV_DX_interop).
+        /// </summary>
         public bool PerferPerfomance
         {
             get { return (bool)GetValue(PerferPerfomanceProperty); }
@@ -377,7 +380,14 @@ namespace OpenTkControl
         /// <param name="action">The action to run</param>
         /// <returns>a Task that will complete when the action finishes running or null if already complete</returns>
         public abstract Task RunOnUiThread(Action action);
-        public abstract Task<T> RunOnUiThread<T>(Func<T> action);
+
+        /// <summary>
+        /// Executes an func on the UI thread.
+        /// </summary>
+        /// <typeparam name="T">The type of return value required</typeparam>
+        /// <param name="func">The function to run</param>
+        /// <returns>a Task that will complete when the func finishes running or null if already complete</returns>
+        public abstract Task<T> RunOnUiThread<T>(Func<T> func);
 
         /// <summary>
         /// Called when this control is loaded
@@ -440,8 +450,9 @@ namespace OpenTkControl
                 _context.LoadAll();
                 _context.MakeCurrent(_windowInfo);
 
+                //maybe InitOpenGl() not in UI thread.
                 if (RunOnUiThread(()=>PerferPerfomance).Result)
-                    IsUsingNVDXInterop = TryInitNVDXIntrop();
+                    IsUsingNVDXInterop = TryInitNVDXIntropDevice();
             }
             catch (Exception e)
             {
@@ -449,14 +460,15 @@ namespace OpenTkControl
             }
         }
 
-        private bool TryInitNVDXIntrop()
+        /// <summary>
+        /// Try to initialize and use OpenGL extension named WGL_NV_DX_interop.
+        /// </summary>
+        /// <returns>if return true means this extension is usable and initialized successfully.</returns>
+        private bool TryInitNVDXIntropDevice()
         {
             try
             {
                 _wgl_d3d = new Direct3DEx();
-
-                int w = (int)ActualWidth;
-                int h = (int)ActualHeight;
 
                 var present_params = new PresentParameters()
                 {
@@ -474,6 +486,9 @@ namespace OpenTkControl
                 CreateFlags.HardwareVertexProcessing | CreateFlags.Multithreaded | CreateFlags.FpuPreserve,
                 present_params);
 
+                _wgl_fbo = GL.GenFramebuffer();
+
+                //Check if current graphics card support this extension.
                 if (!OpenGLExtensionLoader.LoadWGLExtension<WGL_NV_DX_interop>())
                     return false;
 
@@ -818,38 +833,28 @@ namespace OpenTkControl
             }
         }
 
+        /// <summary>
+        /// Rebuild resources according to new size 
+        /// </summary>
+        /// <param name="width">The width of the new buffers</param>
+        /// <param name="height">The height of the new buffers</param>
         private void ResizeNVDXIntropResource(int width, int height)
         {
             CleanNVDXIntropResource();
 
-            /*
-             Normally Nvidia graphics card support CreateRenderTarget() but Intel can't do it. the later will get InvaildOperation error at glFramebufferTexture2D().
-             
-             */
+            #region Share normal DirectX texture.
 
-            /*// Maybe not work in Intel :b
-            _wgl_dx_shared_surface = Surface.CreateRenderTarget(
-            _wgl_device,
-            width,
-            height,
-            Format.A8R8G8B8,
-            MultisampleType.None,
-            0,
-            false);
-            */
+            //reference https://github.com/halogenica/WGL_NV_DX/blob/master/SharedResource.cpp#L165-L182
 
-            var share_handler=IntPtr.Zero;
+            var share_handler =IntPtr.Zero;
             _wgl_dx_texture = new Texture(_wgl_device, width, height, 0, Usage.RenderTarget, Format.A8R8G8B8, Pool.Default,ref share_handler);
             _wgl_dx_shared_surface = _wgl_dx_texture.GetSurfaceLevel(0);
             
-            //_wgl_dx_shared_surface = Surface.CreateOffscreenPlain(_wgl_device, width, height, Format.A8R8G8B8, Pool.Default);
-
             _wgl_gl_shared_texture = GL.GenTexture();
 
+            //extension interop2 will ignore it in DX10 and DX11.
             if (!WGL_NV_DX_interop.DXSetResourceShareHandleNV(_wgl_dx_texture.NativePointer, share_handler))
-            {
                 throw new Exception("ResizeNVDXIntropResource(): DXSetResourceShareHandleNV() fail");
-            }
 
             _wgl_handled_shared_surface = WGL_NV_DX_interop.DXRegisterObjectNV(
             _wgl_device_handler,
@@ -858,9 +863,10 @@ namespace OpenTkControl
             (uint)TextureTarget.Texture2D,
             WGL_NV_DX_interop.Access.WGL_ACCESS_READ_WRITE_NV);
 
+            #endregion
+
             _wgl_block_surfaces = new[] { _wgl_handled_shared_surface };
 
-            _wgl_fbo = GL.GenFramebuffer();
             GL.BindFramebuffer(FramebufferTarget.Framebuffer, _wgl_fbo);
             {
                 GL.FramebufferTexture2D(
@@ -870,12 +876,14 @@ namespace OpenTkControl
                 (uint)_wgl_gl_shared_texture,
                 0);
 
+                //reference https://github.com/halogenica/WGL_NV_DX/blob/master/SharedResource.cpp#L364-L381
                 var status = GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer);
                 if (status != FramebufferErrorCode.FramebufferComplete && status != FramebufferErrorCode.FramebufferUnsupported)
                 {
                     //clean error ,maybe FramebufferTexture2D() get InvaildOperation.
                     GL.GetError();
-
+                    
+                    //use default implement and clean resource.
                     IsUsingNVDXInterop = false;
                     CleanNVDXIntropResource();
                     CleanNVDXIntropDeviceResource();
@@ -886,6 +894,9 @@ namespace OpenTkControl
             GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
         }
 
+        /// <summary>
+        /// Release all resource what extension WGL_NV_DX_introp need.
+        /// </summary>
         private void CleanNVDXIntropDeviceResource()
         {
             if (_wgl_device_handler!=null)
@@ -900,6 +911,12 @@ namespace OpenTkControl
                 _wgl_device = null;
             }
 
+            if (_wgl_fbo != 0)
+            {
+                GL.DeleteFramebuffer(_wgl_fbo);
+                _wgl_fbo = 0;
+            }
+
             if (_wgl_d3d!=null)
             {
                 _wgl_d3d.Dispose();
@@ -907,6 +924,9 @@ namespace OpenTkControl
             }
         }
 
+        /// <summary>
+        /// Release all resource what older buffer rendering need.
+        /// </summary>
         private void CleanNVDXIntropResource()
         {
             if (_wgl_dx_texture!=null)
@@ -923,12 +943,6 @@ namespace OpenTkControl
                 _wgl_dx_shared_surface.Dispose();
                 _wgl_dx_shared_surface = null;
                 _wgl_block_surfaces = null;
-            }
-
-            if (_wgl_fbo!=0)
-            {
-                GL.DeleteFramebuffer(_wgl_fbo);
-                _wgl_fbo = 0;
             }
 
             if (_wgl_gl_shared_texture != 0)
@@ -970,6 +984,9 @@ namespace OpenTkControl
             CheckGLError();
         }
 
+        /// <summary>
+        /// If there is a opengl error and it will throw a GraphicsException.
+        /// </summary>
         private void CheckGLError()
         {
             ErrorCode error = GL.GetError();
