@@ -8,6 +8,10 @@ using System.Threading.Tasks;
 
 namespace OpenTkControl.Extension
 {
+    /// <summary>
+    /// Document: https://www.khronos.org/registry/OpenGL/extensions/NV/WGL_NV_DX_interop.txt
+    /// Code reference: https://github.com/yk35/WpfOpenGLBitmap/blob/master/WpfOpenGLBitmap/Helpers/WGL_NV_DX_interop.cs
+    /// </summary>
     [OpenGLExtension]
     public class WGL_NV_DX_interop
     {

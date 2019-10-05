@@ -9,6 +9,9 @@ using System.Threading.Tasks;
 
 namespace OpenTkControl.Extension
 {
+    /// <summary>
+    /// This is a loader that you can load OpenGL extension and get their function though attributes mark. 
+    /// </summary>
     public static class OpenGLExtensionLoader
     {
         public static bool LoadWGLExtension<T>()
@@ -21,6 +24,7 @@ namespace OpenTkControl.Extension
                 {
                     var extension_name = string.IsNullOrWhiteSpace(extension.ExtensionName) ? type.Name : extension.ExtensionName;
 
+                    // Code reference: https://github.com/yk35/WpfOpenGLBitmap/blob/master/WpfOpenGLBitmap/Helpers/WGL_NV_DX_interop.cs
                     var wgl = typeof(OpenTK.Platform.Windows.All).Assembly.GetType("OpenTK.Platform.Windows.Wgl", true);
                     var wgl_object = wgl.GetConstructor(new Type[] { }).Invoke(new object[] { });
 
